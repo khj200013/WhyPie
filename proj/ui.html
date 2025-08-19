@@ -1,0 +1,228 @@
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8">
+  <title>PublicWiSafe — Windows PoC</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <style>
+    :root { --fg:#111; --muted:#555; --card:#f6f8fa; --line:#eee; }
+    body{font-family:system-ui,Segoe UI,Roboto,Apple SD Gothic Neo,Malgun Gothic,sans-serif;margin:24px;color:var(--fg)}
+    h1{margin:0 0 8px 0}
+    button{padding:8px 14px;border:1px solid #ddd;border-radius:10px;background:#fafafa;cursor:pointer}
+    button[disabled]{opacity:.6;cursor:not-allowed}
+    .row{margin:14px 0}
+    pre{background:var(--card);padding:12px;border-radius:10px;overflow:auto}
+    .card{border:1px solid var(--line);border-radius:14px;padding:14px;margin:14px 0;box-shadow:0 1px 2px rgba(0,0,0,.03)}
+    .badge{display:inline-block;padding:2px 8px;border-radius:999px;font-size:12px}
+    .SAFE{background:#e6ffed}
+    .WARN{background:#fff7e6}
+    .RISK{background:#ffe6e6}
+    .k{color:var(--muted)}
+    .grid{display:grid;grid-template-columns:1fr;gap:8px}
+    .meter{background:#f0f0f0;border-radius:10px;height:12px;position:relative}
+    .bar{position:absolute;left:0;top:0;height:100%;border-radius:10px;transition:width .3s}
+    .bar.good{background:#34c759}
+    .bar.mid{background:#ffcc00}
+    .bar.bad{background:#ff3b30}
+    .rowflex{display:flex;gap:8px;flex-wrap:wrap;align-items:center}
+    .small{font-size:12px;color:var(--muted)}
+    table{width:100%;border-collapse:collapse}
+    th,td{padding:6px 8px;border-bottom:1px solid #eee;text-align:left}
+    th{background:#fafafa}
+    .riskHi{color:#b00020;font-weight:600}
+    .riskMd{color:#b36b00;font-weight:600}
+    .riskLo{color:#0a7c2f;font-weight:600}
+    code{background:var(--card);padding:2px 6px;border-radius:6px}
+    details summary{cursor:pointer}
+    .pill{display:inline-block;border:1px solid #ddd;border-radius:999px;padding:2px 8px;font-size:12px;margin-left:6px}
+    .spinner{width:14px;height:14px;border:2px solid #ddd;border-top-color:#333;border-radius:50%;display:inline-block;animation:spin .8s linear infinite;vertical-align:-2px;margin-left:6px}
+    @keyframes spin {to{transform:rotate(360deg)}}
+  </style>
+</head>
+<body>
+  <h1>PublicWiSafe — Windows PoC</h1>
+  <div class="row rowflex">
+    <button id="btn">스캔 & 리포트</button>
+    <button id="btnai">AI 요약(GPT)</button>
+    <span id="status" class="k"></span>
+  </div>
+
+  <div id="out"></div>
+  <div id="aisum"></div>
+
+  <script>
+    const statusEl = document.getElementById('status');
+    function badge(lvl){ return `<span class="badge ${lvl}">${lvl}</span>`; }
+    function bar(val){
+      const cls = val>=80?'good':(val>=60?'mid':'bad');
+      return `<div class="meter"><div class="bar ${cls}" style="width:${val}%;"></div></div>`;
+    }
+    function esc(s){return String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));}
+    function riskClass(v){ return v>=80?'riskHi':(v>=60?'riskMd':'riskLo'); }
+    function setBusy(btn, txt){
+      btn.disabled = true;
+      const old = btn.dataset.label ?? btn.textContent;
+      btn.dataset.label = old;
+      btn.innerHTML = esc(txt) + ' <span class="spinner"></span>';
+      statusEl.textContent = txt + '…';
+    }
+    function clearBusy(btn){
+      btn.disabled = false;
+      btn.innerHTML = esc(btn.dataset.label || '');
+      statusEl.textContent = '';
+    }
+
+    async function run(){
+      const btn = document.getElementById('btn');
+      setBusy(btn, '스캔 중');
+      try{
+        const r = await fetch('/report');
+        if (!r.ok){ alert('에러: '+await r.text()); return; }
+        const j = await r.json();
+        window.__lastReport = j;
+        const s = j.score, scan = j.scan, b = s.breakdown;
+
+        const ssid = scan.ssid || '(알 수 없음)';
+        const auth = scan.auth ?? 'unknown';
+        const cipher = scan.cipher ?? 'unknown';
+        const band = scan.band ? `${scan.band}GHz` : 'unknown';
+        const channel = (scan.channel ?? 'unknown');
+        const signal = (scan.signalPct ?? 0);
+
+        const gw = s.gateway || '(미확인)';
+        const gwDet = s.gatewayOpenDetailed || [];
+        const gwRows = gwDet.length
+          ? gwDet.map(x=>`<li><span class="${riskClass(x.risk)}">${x.risk}</span> — <b>${x.port}</b> <span class="small">${esc(x.reason)}</span></li>`).join('')
+          : '<li>없음</li>';
+
+        const localDet = s.localListeningDetailed || [];
+        const localRows = localDet.length
+          ? localDet.map(x=>`<tr><td class="${riskClass(x.risk)}">${x.risk}</td><td>${esc(x.address)}</td><td><b>${x.port}</b></td><td>${x.pid}</td><td class="small">${esc(x.reason)}</td></tr>`).join('')
+          : `<tr><td colspan="5">LISTEN 포트 없음</td></tr>`;
+
+        const tlsGw = s.tls?.gateway || [];
+        const hasRow = tlsGw.length > 0;
+        const hasHttpOnly = (gwDet.some(x=>x.port===80||x.port===8080) && !gwDet.some(x=>[443,8443,9443,10443,4443,4433,7001].includes(x.port)));
+        const noteGW = s.tls?.noteGateway || (hasRow ? '' : (hasHttpOnly ? 'HTTPS 관리 포트 미탐지(HTTP만 열림/비활성)' : '게이트웨이 서비스 미탐지'));
+        const tlsGwRows = hasRow
+          ? tlsGw.map(t=>`<tr>
+              <td>${esc(t.host)}:${t.port}</td>
+              <td>${t.supported ? 'Yes' : 'No'}</td>
+              <td>${esc(t.tlsVersion||'-')}</td>
+              <td>${esc(t.cipherSuite||'-')}</td>
+              <td>${t.validChain ? 'OK' : 'NG'} / ${t.hostnameMatch ? 'Name' : 'NoName'} / ${t.selfSigned ? 'Self' : '-'}</td>
+              <td>${esc(t.notAfter||'-')} (${t.daysLeft||0}d)</td>
+              <td class="${riskClass(100-(t.score||0))}">${t.score||0}</td>
+              <td class="small">${esc((t.reasons||[]).join('; '))}</td>
+            </tr>`).join('')
+          : `<tr><td colspan="8">${esc(noteGW||'항목 없음')}</td></tr>`;
+
+        const tlsPortal = s.tls?.portal;
+        const notePT = s.tls?.notePortal || (s.captivePortal==='none' ? '캡티브 포털 미감지' : '포털 대상 정보 없음');
+        const tlsPortalRow = tlsPortal ? `
+          <tr>
+            <td>${esc(tlsPortal.host)}:${tlsPortal.port}</td>
+            <td>${tlsPortal.supported ? 'Yes' : 'No'}</td>
+            <td>${esc(tlsPortal.tlsVersion||'-')}</td>
+            <td>${esc(tlsPortal.cipherSuite||'-')}</td>
+            <td>${tlsPortal.validChain ? 'OK' : 'NG'} / ${tlsPortal.hostnameMatch ? 'Name' : 'NoName'} / ${tlsPortal.selfSigned ? 'Self' : '-'}</td>
+            <td>${esc(tlsPortal.notAfter||'-')} (${tlsPortal.daysLeft||0}d)</td>
+            <td class="${riskClass(100-(tlsPortal.score||0))}">${tlsPortal.score||0}</td>
+            <td class="small">${esc((tlsPortal.reasons||[]).join('; '))}</td>
+          </tr>` : `<tr><td colspan="8">${esc(notePT||'포털 TLS 정보 없음')}</td></tr>`;
+
+        const use = s.useGuess || {};
+        const usePill = `<span class="pill">${esc(use.label||'unknown')} · ${use.confidence||0}%</span>`
+
+        document.getElementById('out').innerHTML = `
+          <div class="card">
+            <div><b>${ssid}</b> – 점수 <b>${s.score}</b> / <span class="badge ${s.level}">${s.level}</span> ${usePill}</div>
+            <div class="small">※ 전체 점수는 위험지수 기반(그래프는 항목별 퍼센트)</div>
+            <div class="k">인증 ${auth}, 암호화 ${cipher}, 밴드 ${band}, 채널 ${channel}, 신호 ${signal}%</div>
+          </div>
+
+          <div class="card">
+            <div class="rowflex"><b>대시보드(항목별 0–100)</b><span class="small">100이 바람직</span></div>
+            <div class="grid">
+              <div>인증/모드: ${b.auth}% ${bar(b.auth)}</div>
+              <div>암호화: ${b.cipher}% ${bar(b.cipher)}</div>
+              <div>PMF(관리 프레임 보호): ${b.pmf}% ${bar(b.pmf)}</div>
+              <div>포털 신호: ${b.portal}% ${bar(b.portal)}</div>
+              <div>게이트웨이 서비스 노출: ${b.ports}% ${bar(b.ports)}</div>
+            </div>
+          </div>
+
+          <div class="card">
+            <div><b>TLS 검사</b></div>
+            <div class="small">게이트웨이 관리 UI/포털의 HTTPS 상태(버전/암호군/체인/만료/이름일치/실패 사유)</div>
+            <details open>
+              <summary><b>게이트웨이</b> <span class="small">(HTTPS 포트 발견 시 표기)</span></summary>
+              <table>
+                <thead><tr><th>대상</th><th>지원</th><th>TLS</th><th>Cipher</th><th>검증</th><th>만료</th><th>점수</th><th>사유</th></tr></thead>
+                <tbody>${tlsGwRows}</tbody>
+              </table>
+            </details>
+            <details style="margin-top:8px" open>
+              <summary><b>포털</b> ${s.portalHost?`<code>${esc(s.portalHost)}</code>`:''}</summary>
+              <table>
+                <thead><tr><th>대상</th><th>지원</th><th>TLS</th><th>Cipher</th><th>검증</th><th>만료</th><th>점수</th><th>사유</th></tr></thead>
+                <tbody>${tlsPortalRow}</tbody>
+              </table>
+            </details>
+          </div>
+
+          <div class="card">
+            <div><b>포트 요약</b></div>
+            <div class="k">게이트웨이(${esc(gw)}) 오픈 TCP — <span class="small">위험 높은 순</span></div>
+            <ul style="margin-top:6px">${gwRows}</ul>
+
+            <details style="margin-top:10px" open>
+              <summary><b>로컬 PC LISTEN 포트</b> <span class="small">(위험 높은 순 정렬)</span></summary>
+              <table>
+                <thead><tr><th>위험</th><th>주소</th><th>포트</th><th>PID</th><th>근거</th></tr></thead>
+                <tbody>${localRows}</tbody>
+              </table>
+            </details>
+          </div>
+
+          <details class="card">
+            <summary><b>원시 데이터(JSON)</b></summary>
+            <pre>${esc(JSON.stringify(j, null, 2))}</pre>
+          </details>
+        `;
+
+        document.getElementById('aisum').innerHTML = '';
+      } finally {
+        clearBusy(btn);
+      }
+    }
+
+    async function runAI(){
+      const btn = document.getElementById('btnai');
+      setBusy(btn, '요약 중');
+      try{
+        const r = await fetch('/ai');
+        if (!r.ok){ alert('AI 요약 에러: '+await r.text()); return; }
+        const j = await r.json();
+        const kf = (j.key_findings||[]).map(x=>`<li>${esc(x)}</li>`).join('') || '<li>-</li>';
+        const rec = (j.recommendations||[]).map(x=>`<li>${esc(x)}</li>`).join('') || '<li>-</li>';
+
+        document.getElementById('aisum').innerHTML = `
+          <div class="card">
+            <div><b>AI 요약</b> <span class="small">(provider: ${esc(j.provider||'local')})</span></div>
+            <div style="margin-top:8px"><b>제공자 관점</b><div class="small" style="white-space:pre-wrap">${esc(j.provider_summary||'-')}</div></div>
+            <div style="margin-top:8px"><b>사용자 관점</b><div class="small" style="white-space:pre-wrap">${esc(j.user_summary||'-')}</div></div>
+            <div style="margin-top:8px"><b>핵심 사항</b><ul>${kf}</ul></div>
+            <div style="margin-top:8px"><b>권고</b><ul>${rec}</ul></div>
+          </div>
+        `;
+      } finally {
+        clearBusy(btn);
+      }
+    }
+
+    document.getElementById('btn').onclick = run;
+    document.getElementById('btnai').onclick = runAI;
+  </script>
+</body>
+</html>
